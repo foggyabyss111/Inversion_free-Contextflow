@@ -7,7 +7,7 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from .attention import attention as flash_attention
 
 __all__ = ['WanModel']
 
@@ -124,10 +124,21 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, pnp, progress_id, sampling_steps,
-                index=None,
-                injection_step=None,
-                latent_output_dir=None,):
+    def forward(
+        self,
+        x,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        pnp,
+        progress_id,
+        sampling_steps,
+        index=None,
+        injection_step=None,
+        latent_output_dir=None,
+        pnp_mode=None,
+        pnp_cache=None,
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -148,51 +159,41 @@ class WanSelfAttention(nn.Module):
         q=rope_apply(q, grid_sizes, freqs)
         k=rope_apply(k, grid_sizes, freqs)
         
-        # PnP Injection
-        if pnp is True and progress_id is not None and sampling_steps is not None:
-            early_steps_threshold = int(injection_step * sampling_steps) # 前 20%
-            
-            if progress_id < early_steps_threshold:
-                if b == 3:
-                    
-                    k_1 = torch.concat((k[1], k[0].clone()), dim=0)
-                    v_1 = torch.concat((v[1], v[0].clone()), dim=0)
-                    
-                    k_2 = torch.concat((k[2], k[0].clone()), dim=0)
-                    v_2 = torch.concat((v[2], v[0].clone()), dim=0)
-                    
-                    new_k = torch.stack([k_1, k_2], dim=0)
-                    new_v = torch.stack([v_1, v_2], dim=0)
-                
-                        
-                    x_old = flash_attention(
-                        q=(q[0].unsqueeze(0)),
-                        k=(k[0].unsqueeze(0)),
-                        v=(v[0].unsqueeze(0)),
-                        k_lens=seq_lens[0:1] if seq_lens is not None else None,
-                        window_size=self.window_size)
-                    
-                    x_new = flash_attention(
-                        q=(q[1:3]),
-                        k=(new_k),
-                        v=(new_v),
-                        k_lens=None,
-                        window_size=self.window_size)
-                    
-                    x = torch.concat((x_old, x_new), dim=0)
-                        
-                    x = x.flatten(2)
-                    x = self.o(x)
-                    
-                    
-                    return x
-        
+        k_lens = seq_lens
+
+        # ContextFlow-style PnP write/read:
+        # write: cache reference branch K/V
+        # read: inject cached reference K/V into current batch attention
+        if pnp and progress_id is not None and sampling_steps is not None:
+            ratio = 1.0 if injection_step is None else float(injection_step)
+            early_steps_threshold = max(1, int(ratio * sampling_steps))
+            enable_pnp = progress_id < early_steps_threshold
+            cache_key = (int(index) if index is not None else -1, int(progress_id))
+
+            if enable_pnp and pnp_mode == "write" and pnp_cache is not None and b >= 1:
+                pnp_cache[cache_key] = (
+                    k[0].detach().clone(),
+                    v[0].detach().clone(),
+                )
+
+            if enable_pnp and pnp_mode == "read" and pnp_cache is not None and cache_key in pnp_cache:
+                k_ref, v_ref = pnp_cache[cache_key]
+                k_ref = k_ref.to(device=k.device, dtype=k.dtype)
+                v_ref = v_ref.to(device=v.device, dtype=v.dtype)
+                k_ref_batch = k_ref.unsqueeze(0).expand(b, -1, -1, -1)
+                v_ref_batch = v_ref.unsqueeze(0).expand(b, -1, -1, -1)
+
+                # concat reference tokens to all current branches
+                k = torch.cat([k, k_ref_batch], dim=1)
+                v = torch.cat([v, v_ref_batch], dim=1)
+                if seq_lens is not None:
+                    k_lens = seq_lens + k_ref.size(0)
 
         x = flash_attention(
             q,
             k,
             v=v,
-            k_lens=seq_lens,
+            k_lens=k_lens,
             window_size=self.window_size)
 
         # output
@@ -331,6 +332,8 @@ class WanAttentionBlock(nn.Module):
         index,
         injection_step,
         latent_output_dir,
+        pnp_mode,
+        pnp_cache,
     ):
         r"""
         Args:
@@ -348,7 +351,8 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs, pnp, progress_id, sampling_steps, index, injection_step, latent_output_dir)
+            freqs, pnp, progress_id, sampling_steps, index, injection_step, latent_output_dir,
+            pnp_mode, pnp_cache)
         
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
@@ -549,6 +553,8 @@ class WanModel(ModelMixin, ConfigMixin):
         attn_storage_list=None,
         pnp=False,              # 新增
         pnp_layers=None,        # 新增
+        pnp_mode=None,
+        pnp_cache=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -631,6 +637,8 @@ class WanModel(ModelMixin, ConfigMixin):
             pnp=False,              # 新增
             index=None,                # 新增 index 占位符
             latent_output_dir=None,    # 确保 AttentionBlock 里的参数都有
+            pnp_mode=pnp_mode,
+            pnp_cache=pnp_cache,
             )
 
         #print("x.shape:", x.shape)
