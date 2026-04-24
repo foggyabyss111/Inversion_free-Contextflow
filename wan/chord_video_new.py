@@ -129,6 +129,62 @@ class ChordVideoEditor:
         # 默认负提示词
         self.sample_neg_prompt = config.sample_neg_prompt
 
+    def _predict_eps_triplet(
+        self,
+        latent,
+        t,
+        context_src,
+        context_tgt,
+        context_neg,
+        max_seq_len,
+        progress_id,
+        sampling_steps,
+    ):
+        preds = self.model(
+            x=[latent, latent, latent],
+            t=torch.stack([t, t, t]).to(self.device),
+            context=[context_src[0], context_tgt[0], context_neg[0]],
+            seq_len=max_seq_len,
+            progress_id=progress_id,
+            sampling_steps=sampling_steps,
+            pnp=False,
+            pnp_layers=None,
+            pnp_mode=None,
+            pnp_cache=None,
+            injection_step=None,
+        )
+        return preds[0], preds[1], preds[2]
+
+    def _predict_eps_pair(
+        self,
+        latent,
+        t,
+        context_src,
+        context_tgt,
+        max_seq_len,
+        progress_id,
+        sampling_steps,
+    ):
+        preds = self.model(
+            x=[latent, latent],
+            t=torch.stack([t, t]).to(self.device),
+            context=[context_src[0], context_tgt[0]],
+            seq_len=max_seq_len,
+            progress_id=progress_id,
+            sampling_steps=sampling_steps,
+            pnp=False,
+            pnp_layers=None,
+            pnp_mode=None,
+            pnp_cache=None,
+            injection_step=None,
+        )
+        return preds[0], preds[1]
+
+    def _sigma_from_timestep(self, scheduler, timestep):
+        t_cpu = timestep.detach().cpu() if isinstance(timestep, torch.Tensor) else torch.tensor(float(timestep))
+        timestep_id = torch.argmin((scheduler.timesteps - t_cpu).abs())
+        return scheduler.sigmas[timestep_id]
+
     def chord_generate(
         self,
         src_video,                    # 源视频张量 (C, N, H, W)
@@ -174,9 +230,22 @@ class ChordVideoEditor:
 
         shift = kwargs.get("shift", 5.0)
         sample_solver = kwargs.get("sample_solver", "fm_new")
-        use_pnp = kwargs.get("use_pnp", False)
-        pnp_layers = kwargs.get("pnp_layers", None)
-        pnp_injection_step = kwargs.get("pnp_injection_step", 0.2)
+        min_effective_steps = int(kwargs.get("min_effective_steps", 12))
+        chord_t_delta = float(kwargs.get("chord_t_delta", 0.04))
+        u_hat_clip_norm = float(kwargs.get("u_hat_clip_norm", 0.0))
+        edit_update_mode = str(kwargs.get("edit_update_mode", "u_hat")).lower()
+        direction_mode = str(kwargs.get("direction_mode", "no_cfg")).lower()
+        direction_cfg_weight = float(kwargs.get("direction_cfg_weight", 0.0))
+        direction_cfg_scale = float(kwargs.get("direction_cfg_scale", guide_scale))
+        n_steps = int(max(1, kwargs.get("n_steps", sampling_steps)))
+        t_end = float(kwargs.get("t_end", 0.30))
+        if direction_mode not in {"no_cfg", "cfg", "mix"}:
+            direction_mode = "no_cfg"
+        direction_cfg_weight = max(0.0, min(1.0, direction_cfg_weight))
+
+        # 当前阶段只做纯文本引导 Chord Video，忽略 PnP 相关参数。
+        if kwargs.get("use_pnp", False):
+            logging.warning("当前实验阶段已禁用 PnP，参数 use_pnp=True 将被忽略。")
 
         if sample_solver != "fm_new":
             raise NotImplementedError(
@@ -227,20 +296,35 @@ class ChordVideoEditor:
 
         # 源视频编码到 latent 空间
         z_src = self.vae.encode([src_video])[0].to(self.device, dtype=torch.float32)
-        noise = torch.randn_like(z_src, dtype=torch.float32, device=self.device)
 
-        # 构造采样器并按 t_start 加噪得到起点 z_t
+        # Inversion-Free 设定：直接在干净 latent 上做编辑位移，不走去噪链。
+        t_start = float(max(0.0, min(1.0, t_start)))
+        t_end = float(max(0.0, min(t_start, t_end)))
+        if chord_t_delta >= t_start:
+            safe_delta = max(1, self.num_train_timesteps)
+            chord_t_delta = max(0.0, t_start - 1.0 / safe_delta)
+
+        # 仅用于构造 sigma(t) 和 add_noise(x, noise, t)
         scheduler = FlowMatchNewScheduler(
             num_inference_steps=sampling_steps,
             num_train_timesteps=self.num_train_timesteps,
             shift=shift,
         )
-        timesteps = scheduler.timesteps
-        t_start_value = float(t_start) * float(self.num_train_timesteps)
-        t_start_tensor = torch.tensor(t_start_value, dtype=timesteps.dtype)
-        start_idx = int(torch.argmin((timesteps - t_start_tensor).abs()).item())
-        timesteps = timesteps[start_idx:]
-        z_t = scheduler.add_noise(z_src, noise, timesteps[0])
+        noise_samples = int(max(1, kwargs.get("noise_samples", 1)))
+        noise_list = [
+            torch.randn_like(z_src, dtype=torch.float32, device=self.device)
+            for _ in range(noise_samples)
+        ]
+        if n_steps == 1:
+            t_grid = [t_start]
+        else:
+            t_grid = torch.linspace(
+                t_start,
+                t_end,
+                steps=n_steps,
+                device=self.device,
+                dtype=torch.float32,
+            ).tolist()
 
         @contextmanager
         def noop_no_sync():
@@ -248,74 +332,111 @@ class ChordVideoEditor:
 
         no_sync = getattr(self.model, "no_sync", noop_no_sync)
 
-        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        with torch.autocast(device_type="cuda", dtype=self.param_dtype), torch.no_grad(), no_sync():
             self.model.to(self.device)
-            latent = z_t
-            latent_ref = z_t.clone()
-            pnp_cache = {}
+            x_curr = z_src.clone()
 
-            # 三分支（src/tgt/uncond）+ Chord 方向编辑
-            for progress_id, t in enumerate(tqdm(timesteps, desc="Chord sampling")):
-                if use_pnp:
-                    # write: 用 source/reference 分支写入 K/V cache
-                    ref_preds = self.model(
-                        x=[latent_ref, latent_ref],
-                        t=torch.stack([t, t]).to(self.device),
-                        context=[context_src[0], context_neg[0]],
-                        seq_len=max_seq_len,
-                        progress_id=progress_id,
-                        sampling_steps=len(timesteps),
-                        pnp=True,
-                        pnp_layers=pnp_layers,
-                        pnp_mode="write",
-                        pnp_cache=pnp_cache,
-                        injection_step=pnp_injection_step,
-                    )
-                    eps_ref_cfg = ref_preds[1] + guide_scale * (ref_preds[0] - ref_preds[1])
-                    latent_ref = scheduler.step(
-                        eps_ref_cfg.unsqueeze(0),
-                        t,
-                        latent_ref.unsqueeze(0),
-                    ).squeeze(0)
-
-                noise_preds = self.model(
-                    x=[latent, latent, latent],
-                    t=torch.stack([t, t, t]).to(self.device),
-                    context=[context_src[0], context_tgt[0], context_neg[0]],
-                    seq_len=max_seq_len,
-                    progress_id=progress_id,
-                    sampling_steps=len(timesteps),
-                    pnp=use_pnp,
-                    pnp_layers=pnp_layers,
-                    pnp_mode="read" if use_pnp else None,
-                    pnp_cache=pnp_cache if use_pnp else None,
-                    injection_step=pnp_injection_step if use_pnp else None,
+            def estimate_dv_at_t(x_anchor, t_ratio, progress_id, total_steps):
+                t_ratio = float(max(0.0, min(1.0, t_ratio)))
+                t_tensor = torch.tensor(
+                    t_ratio * float(self.num_train_timesteps),
+                    dtype=torch.float32,
+                    device=self.device,
                 )
+                dv_sum = torch.zeros_like(x_anchor)
 
-                eps_src = noise_preds[0]
-                eps_tgt = noise_preds[1]
-                eps_uncond = noise_preds[2]
+                for noise in noise_list:
+                    z_s = scheduler.add_noise(x_anchor, noise, t_tensor)
+                    if direction_mode == "cfg":
+                        eps_src_s, eps_tgt_s, eps_uncond_s = self._predict_eps_triplet(
+                            latent=z_s,
+                            t=t_tensor,
+                            context_src=context_src,
+                            context_tgt=context_tgt,
+                            context_neg=context_neg,
+                            max_seq_len=max_seq_len,
+                            progress_id=progress_id,
+                            sampling_steps=total_steps,
+                        )
+                        # 双边指导 (Bilateral Guidance): 
+                        # 源图通过 (eps_src - uncond) 远离无关内容，目标图通过 (eps_tgt - uncond) 靠近新内容。
+                        # 这比单边 CFG 更能锁住背景，防止“桌子也跟着变黑”。
+                        eps_src_cfg = eps_uncond_s + direction_cfg_scale * (eps_src_s - eps_uncond_s)
+                        eps_tgt_cfg = eps_uncond_s + direction_cfg_scale * (eps_tgt_s - eps_uncond_s)
+                        
+                        eps_src_eff = eps_src_cfg
+                        eps_tgt_eff = eps_tgt_cfg
+                    elif direction_mode == "mix":
+                        eps_src_s, eps_tgt_s, eps_uncond_s = self._predict_eps_triplet(
+                            latent=z_s,
+                            t=t_tensor,
+                            context_src=context_src,
+                            context_tgt=context_tgt,
+                            context_neg=context_neg,
+                            max_seq_len=max_seq_len,
+                            progress_id=progress_id,
+                            sampling_steps=total_steps,
+                        )
+                        eps_src_cfg = eps_uncond_s + direction_cfg_scale * (eps_src_s - eps_uncond_s)
+                        eps_tgt_cfg = eps_uncond_s + direction_cfg_scale * (eps_tgt_s - eps_uncond_s)
+                        
+                        # 凸组合：融合了直接配对差分的稳定性和双边 CFG 的强推力与背景锚定。
+                        eps_src_eff = torch.lerp(eps_src_s, eps_src_cfg, direction_cfg_weight)
+                        eps_tgt_eff = torch.lerp(eps_tgt_s, eps_tgt_cfg, direction_cfg_weight)
+                    else:
+                        # 默认对齐 ChordEdit：不引入 uncond/CFG，直接做 src/tgt 差分
+                        eps_src_s, eps_tgt_s = self._predict_eps_pair(
+                            latent=z_s,
+                            t=t_tensor,
+                            context_src=context_src,
+                            context_tgt=context_tgt,
+                            max_seq_len=max_seq_len,
+                            progress_id=progress_id,
+                            sampling_steps=total_steps,
+                        )
+                        eps_src_eff = eps_src_s
+                        eps_tgt_eff = eps_tgt_s
 
-                # 分别做 CFG，再用 Chord residual 做方向更新
-                eps_src_cfg = eps_uncond + guide_scale * (eps_src - eps_uncond)
-                eps_tgt_cfg = eps_uncond + guide_scale * (eps_tgt - eps_uncond)
-                chord_direction = eps_tgt_cfg - eps_src_cfg
-                eps_edit = eps_src_cfg + step_scale * chord_direction
+                    # 核心修复：直接在 FM 速度域 (Velocity Field) 提取语义差分
+                    # 不要用 x_pred 差分，因为 x_pred = z - sigma*v，其差分为 sigma*(v_src - v_tgt)
+                    # 随着 sigma 趋近于 0，改色推力会指数级衰减，导致“永远改不动”。
+                    # 正确做法：直接使用网络预测的速度 v (即 eps) 的差值作为纯粹的方向。
+                    dv_sum = dv_sum + (eps_tgt_eff - eps_src_eff)
 
-                latent = scheduler.step(
-                    eps_edit.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                ).squeeze(0)
+                return dv_sum / float(len(noise_list)), eps_tgt_eff
 
-            videos = self.vae.decode([latent.to(self.device)])
+            total_steps = len(t_grid)
+            last_eps_tgt = None
+            for progress_id, t_ratio in enumerate(tqdm(t_grid, desc="Chord edit (inversion-free)")):
+                dv_s, last_eps_tgt = estimate_dv_at_t(x_curr, t_ratio, progress_id, total_steps)
+
+                if edit_update_mode == "legacy_eps":
+                    u_hat = dv_s
+                else:
+                    t_s0_ratio = max(0.0, float(t_ratio) - chord_t_delta)
+                    dv_s0, _ = estimate_dv_at_t(x_curr, t_s0_ratio, progress_id, total_steps)
+                    denom = float(t_ratio) + chord_t_delta
+                    if denom <= 1e-6:
+                        u_hat = dv_s
+                    else:
+                        u_hat = (chord_t_delta * dv_s + float(t_ratio) * dv_s0) / denom
+
+                if u_hat_clip_norm > 0:
+                    norm = torch.linalg.vector_norm(u_hat.float())
+                    if torch.isfinite(norm) and norm > u_hat_clip_norm:
+                        u_hat = u_hat * (u_hat_clip_norm / (norm + 1e-6))
+
+                x_curr = x_curr + step_scale * u_hat
+
+            # 移除错误的 cleanup 尝试，避免引入阶跃误差导致闪烁加剧
+            videos = self.vae.decode([x_curr.to(self.device)])
 
             if offload_model:
                 self.model.cpu()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        del z_src, noise, z_t, latent, latent_ref, scheduler
+        del z_src, x_curr, scheduler
         if offload_model and torch.cuda.is_available():
             gc.collect()
             torch.cuda.synchronize()
