@@ -25,7 +25,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@amp.autocast(enabled=False)
+@torch.autocast(device_type='cuda', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -36,7 +36,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-@amp.autocast(enabled=False)
+@torch.autocast(device_type='cuda', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
@@ -47,6 +47,7 @@ def rope_apply(x, grid_sizes, freqs):
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
+        #f 时间维token数；h 高度维token数； w 宽度维token数
 
         # precompute multipliers
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
@@ -155,6 +156,10 @@ class WanSelfAttention(nn.Module):
             v = self.v(x).view(b, s, n, d)
             return q, k, v
 
+        # q/k/v 物理含义：
+        # q: 当前 token 需要从上下文“查询”什么信息
+        # k: 上下文中每个 token 的“索引键”
+        # v: 上下文中每个 token 的“内容值”
         q, k, v = qkv_fn(x)
         q=rope_apply(q, grid_sizes, freqs)
         k=rope_apply(k, grid_sizes, freqs)
@@ -177,17 +182,24 @@ class WanSelfAttention(nn.Module):
                 )
 
             if enable_pnp and pnp_mode == "read" and pnp_cache is not None and cache_key in pnp_cache:
-                k_ref, v_ref = pnp_cache[cache_key]
-                k_ref = k_ref.to(device=k.device, dtype=k.dtype)
-                v_ref = v_ref.to(device=v.device, dtype=v.dtype)
-                k_ref_batch = k_ref.unsqueeze(0).expand(b, -1, -1, -1)
-                v_ref_batch = v_ref.unsqueeze(0).expand(b, -1, -1, -1)
+                # 软注入：按去噪进度衰减的线性插值，不改变序列长度。
+                # current_ratio: 0.0 在起点，1.0 在终点。
+                denom = max(float(sampling_steps), 1.0)
+                current_ratio = float(progress_id) / denom
+                inj_ratio = max(float(injection_step or 0.0), 0.0)
+                if inj_ratio > 0.0 and current_ratio <= inj_ratio and b > 1:
+                    alpha = 0.8 * (1.0 - (current_ratio / inj_ratio))
+                    k_ref, v_ref = pnp_cache[cache_key]
+                    k_ref = k_ref.to(device=k.device, dtype=k.dtype)
+                    v_ref = v_ref.to(device=v.device, dtype=v.dtype)
 
-                # concat reference tokens to all current branches
-                k = torch.cat([k, k_ref_batch], dim=1)
-                v = torch.cat([v, v_ref_batch], dim=1)
-                if seq_lens is not None:
-                    k_lens = seq_lens + k_ref.size(0)
+                    # 仅干预 target 分支（batch index 1），source 分支保持纯净。
+                    # 需要形状一致，否则跳过该步注入以保证稳定性。
+                    if k[1].shape == k_ref.shape and v[1].shape == v_ref.shape:
+                        k = k.clone()
+                        v = v.clone()
+                        k[1] = torch.lerp(k[1], k_ref, alpha)
+                        v[1] = torch.lerp(v[1], v_ref, alpha)
 
         x = flash_attention(
             q,
@@ -344,11 +356,11 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.autocast(device_type='cuda', dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
-        # self-attention
+        # self-attention: 在当前视频 latent token 内做时空信息交互
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
             freqs, pnp, progress_id, sampling_steps, index, injection_step, latent_output_dir,
@@ -361,7 +373,7 @@ class WanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-            with amp.autocast(dtype=torch.float32):
+            with torch.autocast(device_type='cuda', dtype=torch.float32):
                 x = x + y * e[5]
             return x
 
@@ -393,7 +405,7 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.autocast(device_type='cuda', dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
@@ -551,66 +563,79 @@ class WanModel(ModelMixin, ConfigMixin):
         injection_step=None,
         record_attn=False,
         attn_storage_list=None,
-        pnp=False,              # 新增
-        pnp_layers=None,        # 新增
-        pnp_mode=None,
-        pnp_cache=None,
+        pnp=False,              # 是否启用 PnP (Plug-and-Play) 注入
+        pnp_layers=None,        # 启用 PnP 的层索引列表
+        pnp_mode=None,          # PnP 模式: 'write' (存储特征) 或 'read' (注入特征)
+        pnp_cache=None,         # PnP 特征缓存字典
     ):
         r"""
         Forward pass through the diffusion model
 
         Args:
             x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
+                输入视频 latent 列表，每个形状为 [C_in, F, H, W]
+                物理含义：扩散状态变量（当前时刻的视频潜变量）
             t (Tensor):
-                Diffusion timesteps tensor of shape [B]
+                扩散时间步张量，形状为 [B]
+                物理含义：噪声强度/演化时刻（大 t 更噪，小 t 更干净）
             context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
+                文本嵌入列表，每个形状为 [L, C]
+                物理含义：条件语义（“希望生成/编辑成什么”）
             seq_len (`int`):
-                Maximum sequence length for positional encoding
+                位置编码的最大序列长度
             clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode
+                I2V 模式下的 CLIP 图像特征
             y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
-
-        Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+                I2V 模式下的条件视频输入，形状与 x 相同
         """
+        # 1. 检查 I2V 模式下的必要输入
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
-        # params
+            
+        # 2. 确保频率张量 (freqs) 在正确的设备上
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # each in x: [C_in, 1+T/4, H/8, W/8]
-        
+        # 3. 如果是 I2V，将输入噪声 x 和条件视频 y 在通道维度拼接
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-        # each in x: [C_in', 1+T/4, H/8, W/8]
 
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x] # each in x: [1, dim, 1+T/4, H/16, W/16]
+        # 4. Patch Embedding: 将 3D 视频块映射为 Transformer token
+        #    物理含义：把时空体素压缩成一串可被注意力建模的离散 token
+        # 每个 u 形状: [C_in', 1+T/4, H/8, W/8] -> [1, dim, 1+T/4, H/16, W/16]
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x] 
         
+        # 5. 计算每个视频在 patch 后的网格大小 (F, H, W)
+        #    物理含义：token 在时间/高度/宽度上的离散坐标尺寸
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]) # [B, 3]
-        x = [u.flatten(2).transpose(1, 2) for u in x] # each in x: [1, (H*W/256)*(1+T/4), dim]
+            
+        # 6. 展平空间维度并转置: [1, dim, F, H, W] -> [1, F*H*W, dim]
+        x = [u.flatten(2).transpose(1, 2) for u in x] 
+        
+        # 7. 获取每个样本的实际序列长度
+        #    物理含义：每个样本有效 token 数（用于 attention mask / k_lens）
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long) # [B]
         assert seq_lens.max() <= seq_len
+        
+        # 8. 填充 (Padding) 到统一的最大序列长度 seq_len
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
-                      dim=1) for u in x # each: [1, seq_len, dim]
+                      dim=1) for u in x 
         ]) # [B, seq_len, dim]
 
-        # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        # 9. 时间步嵌入: 将标量 t 转换为高维向量 e
+        #    物理含义：把“当前噪声阶段”编码成网络可用的条件信号
+        with torch.autocast(device_type='cuda', dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float())
+            # 将 e 投影并拆分为 6 个调制参数 (用于 DiT Block 的 AdaLN)
+            # e0[:, i, :] 分别控制注意力/FFN中的缩放和偏移，相当于“时刻门控”
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # context
+        # 10. 文本嵌入处理
         context_lens = None
         context = self.text_embedding(
             torch.stack([
@@ -619,11 +644,13 @@ class WanModel(ModelMixin, ConfigMixin):
                 for u in context
             ]))
 
+        # 11. 如果是 I2V，将 CLIP 图像特征拼接到文本 context 前面
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
-        # arguments
+        # 12. 准备传给 Transformer Block 的参数字典
+        # progress_id/sampling_steps: 采样进度信息（给可选 PnP 机制用）
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
@@ -631,18 +658,20 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            progress_id=progress_id, # <--- 新增传递参数
-            sampling_steps=sampling_steps, # <--- 新增传递参数
+            progress_id=progress_id, 
+            sampling_steps=sampling_steps, 
             injection_step=injection_step,
-            pnp=False,              # 新增
-            index=None,                # 新增 index 占位符
-            latent_output_dir=None,    # 确保 AttentionBlock 里的参数都有
+            pnp=False,              
+            index=None,                
+            latent_output_dir=None,    
             pnp_mode=pnp_mode,
             pnp_cache=pnp_cache,
             )
 
-        #print("x.shape:", x.shape)
+        # 13. 遍历所有 Transformer 层 (blocks)
+        #    物理含义：逐层进行“时空自注意力 + 文本交叉注意力 + 前馈变换”
         for index, block in enumerate(self.blocks):
+            # 根据配置决定当前层是否启用 PnP
             if pnp is True and (pnp_layers is not None) and (index in pnp_layers):
                 kwargs['pnp'] = True
                 kwargs['index'] = index
@@ -652,10 +681,12 @@ class WanModel(ModelMixin, ConfigMixin):
                 
             x = block(x, **kwargs)
 
-        # head
+        # 14. 输出头 (Final Layer): 映射回 patch 的输出维度
+        #    物理含义：把 token 表示还原成每个 patch 对应的速度/噪声预测
         x = self.head(x, e)
 
-        # unpatchify
+        # 15. Unpatchify: 将展平的特征向量还原回 3D 视频形状
+        #    返回值物理含义：与输入 latent 同形状的“演化方向场”
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
 

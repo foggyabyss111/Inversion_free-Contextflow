@@ -514,56 +514,81 @@ class WanVAE_(nn.Module):
         return x_recon, mu, log_var
 
     def encode(self, x, scale):
+        # 1. 清除 VAE 缓存 (用于处理因果卷积的 temporal cache)
         self.clear_cache()
-        ## cache
+        
+        # 2. 获取视频帧数并计算迭代次数
+        # 采用分段处理方式以节省显存，每段处理 4 帧 (除第一帧外)
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
-        ## 对encode输入的x，按时间拆分为1、4、4、4....
+        
+        # 3. 循环编码视频片段
         for i in range(iter_):
-            self._enc_conv_idx = [0]
+            self._enc_conv_idx = [0] # 重置层索引
             if i == 0:
+                # 编码第一帧 (作为起始参考)
                 out = self.encoder(
                     x[:, :, :1, :, :],
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx)
             else:
+                # 编码后续的 4 帧片段
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx)
+                # 将编码后的隐向量在时间维度拼接
                 out = torch.cat([out, out_], 2)
+        
+        # 4. 经过 1x1x1 卷积并拆分为均值 (mu) 和方差 (log_var)
+        # 这里实际上只返回了 mu，Wan 似乎使用的是隐空间的均值作为特征
         mu, log_var = self.conv1(out).chunk(2, dim=1)
+        
+        # 5. 归一化处理: (mu - mean) / std
         if isinstance(scale[0], torch.Tensor):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
                 1, self.z_dim, 1, 1, 1)
         else:
             mu = (mu - scale[0]) * scale[1]
+            
+        # 6. 再次清理缓存并返回隐向量
         self.clear_cache()
         return mu
 
     def decode(self, z, scale):
+        # 1. 清除 VAE 缓存
         self.clear_cache()
-        # z: [b,c,t,h,w]
+        
+        # 2. 反归一化处理: z * std + mean
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
                 1, self.z_dim, 1, 1, 1)
         else:
             z = z / scale[1] + scale[0]
+            
+        # 3. 经过 1x1x1 卷积映射回解码空间
         iter_ = z.shape[2]
         x = self.conv2(z)
+        
+        # 4. 循环解码隐向量片段 (逐帧解码以节省显存)
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
+                # 解码第一帧
                 out = self.decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx)
             else:
+                # 解码后续帧
                 out_ = self.decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx)
+                # 在时间维度拼接解码后的视频帧
                 out = torch.cat([out, out_], 2)
+                
+        # 5. 清理缓存并返回重建的视频
         self.clear_cache()
         return out
 
@@ -648,14 +673,14 @@ class WanVAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        with amp.autocast(dtype=self.dtype):
+        with torch.autocast(device_type="cuda", dtype=self.dtype):
             return [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
 
     def decode(self, zs):
-        with amp.autocast(dtype=self.dtype):
+        with torch.autocast(device_type="cuda", dtype=self.dtype):
             return [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
