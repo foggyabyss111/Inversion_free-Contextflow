@@ -803,27 +803,29 @@ class WanI2V:
             return videos[0], videos[1]
         return None, None
 
-    def generate_reconstruction(self,
+    def run_inversion(self,
                  input_prompt,
                  img,
-                 video: torch.Tensor, 
+                 video: torch.Tensor,
                  max_area=720 * 1280,
                  frame_num=81,
                  shift=5.0,
                  sample_solver='fm_new',
                  sampling_steps=50,
-                 guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
                  offload_model=True,
                  latent_name=None,
                  is_delete=False,
+                 save_last_n_steps=6,
                  ):
-        
+        """
+        仅执行 inversion：把视频编码到高噪声轨迹并保存中间 latent。
+        """
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
         video = video.to(self.device)
         if self.rank == 0:
-            print("Reconstruction mode!")
+            print("Inversion mode!")
 
         F = frame_num
         h, w = img.shape[1:]
@@ -841,46 +843,30 @@ class WanI2V:
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
-        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
-        
         # video_latent
         expected_latent_shape = (16, 21, lat_h, lat_w) if not is_delete else (16, 13, lat_h, lat_w)
         latent = self.vae.encode([video])[0]
-        if self.rank == 0:
-            print(latent.shape)
         assert latent.shape == expected_latent_shape
-        
-        
+
         msk = torch.ones(1, 81, lat_h, lat_w, device=self.device) if not is_delete else torch.ones(1, 49, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
+        ], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
-        
-        blank_prompt = ""
 
-        # preprocess
+        blank_prompt = ""
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
             context_blank = self.text_encoder([blank_prompt], self.device)
             if offload_model:
                 self.text_encoder.model.cpu()
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context_blank = self.text_encoder([blank_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
             context_blank = [t.to(self.device) for t in context_blank]
 
         self.clip.model.to(self.device)
@@ -891,19 +877,15 @@ class WanI2V:
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
+                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
                 torch.zeros(3, 80, h, w)
-            ],
-                         dim=1).to(self.device)
+            ], dim=1).to(self.device)
         ])[0] if not is_delete else self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
+                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
                 torch.zeros(3, 48, h, w)
-            ],
-                         dim=1).to(self.device)
+            ], dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
 
@@ -912,199 +894,172 @@ class WanI2V:
             yield
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-        
         save_intermediate_latents_data = {}
 
-        # evaluation mode
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+            if sample_solver != 'fm_new':
+                raise NotImplementedError("run_inversion 仅支持 sample_solver='fm_new'.")
 
-            if sample_solver == 'fm_new':
-                sample_scheduler_inversion = FlowMatchNewScheduler(
-                    num_inference_steps=51,
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=5.0,
-                    inverse_timesteps=True,
-                )
-                timesteps_inversion = sample_scheduler_inversion.timesteps[:-1]
-                if self.rank == 0:
-                    print("time_inversion: ", timesteps_inversion)
-                sample_scheduler = FlowMatchNewScheduler(
-                    num_inference_steps=51,
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=5.0,
-                )
-                timesteps = sample_scheduler.timesteps[:-1]
-                if self.rank == 0:
-                    print("time: ", timesteps)
-                
-            else:
-                raise NotImplementedError("Unsupported solver in reconstruction mode.")
+            sample_scheduler_inversion = FlowMatchNewScheduler(
+                num_inference_steps=sampling_steps,
+                num_train_timesteps=self.num_train_timesteps,
+                shift=shift,
+                inverse_timesteps=True,
+            )
+            timesteps_inversion = sample_scheduler_inversion.timesteps[:-1]
+            keep_steps = max(1, int(save_last_n_steps))
+            save_from_idx = max(0, len(timesteps_inversion) - keep_steps)
 
             if offload_model:
                 torch.cuda.empty_cache()
-
             self.model.to(self.device)
-            
-            # Inversion
+
             for progress_id, t in enumerate(tqdm(timesteps_inversion, "inversion")):
-                
-                if progress_id >= 45:
-                    save_intermediate_latents_data[t.item()] = latent.clone().cpu()          
+                if progress_id >= save_from_idx:
+                    save_intermediate_latents_data[float(t.item())] = latent.clone().cpu()
+
                 latent_model_input = [latent.to(self.device)]
-                
-                timestep = torch.stack([t]).to(self.device) 
-                context_list = [context_blank[0]]
-                clip_fea = torch.cat([clip_context], dim=0)
-                y_list = [y]
-                
+                timestep = torch.stack([t]).to(self.device)
                 noise_preds_list = self.model(
                     x=latent_model_input,
                     t=timestep,
-                    context=context_list,
-                    seq_len=max_seq_len, # seq_len remains the same for padding
-                    clip_fea=clip_fea,
-                    y=y_list,
-                ) 
-                
+                    context=[context_blank[0]],
+                    seq_len=max_seq_len,
+                    clip_fea=torch.cat([clip_context], dim=0),
+                    y=[y],
+                )
                 if offload_model:
-                     torch.cuda.empty_cache()
-                
+                    torch.cuda.empty_cache()
+
                 noise_pred = noise_preds_list[0].to(torch.device('cpu') if offload_model else self.device)
+                latent = latent.to(torch.device('cpu') if offload_model else self.device)
 
-                latent = latent.to(
-                    torch.device('cpu') if offload_model else self.device)
-                
-                if sample_solver == "fm_new":
-                    latents_mid = sample_scheduler_inversion.step_mid(noise_pred.unsqueeze(0), 
-                                                            torch.stack([t]).to(self.device), latent.unsqueeze(0))
-                    
-                    latent_model_input_mid = [latents_mid[0].to(self.device)]
-                    
-                    t_mid = (torch.stack([t]) + sample_scheduler_inversion.timesteps[progress_id + 1]) / 2
-                    timestep_mid = torch.stack([t_mid[0]]).to(self.device) 
-                    
-                    noise_preds_list_mid = self.model(
-                        x=latent_model_input_mid,
-                        t=timestep_mid,
-                        context=context_list,
-                        seq_len=max_seq_len,
-                        clip_fea=clip_fea,
-                        y=y_list,
-                    ) 
-                    
-                    if offload_model:
-                        torch.cuda.empty_cache()
-                    
-                    noise_pred_mid = noise_preds_list_mid[0].to(torch.device('cpu') if offload_model else self.device)
-                    
-                    latent = sample_scheduler_inversion.step_solver(noise_pred_mid.unsqueeze(0), noise_pred.unsqueeze(0), 
-                                                          torch.stack([t]).to(self.device), latent.unsqueeze(0)).squeeze(0)
-                    del latent_model_input_mid
-                    
-                else:       
-                    temp_x0 = sample_scheduler_inversion.step(
-                        noise_pred.unsqueeze(0),
-                        t,
-                        latent.unsqueeze(0),
-                        return_dict=False,
-                        generator=seed_g)[0]
-                    latent = temp_x0.squeeze(0)
-                    
-
-            if self.rank == 0:
-                torch.save(save_intermediate_latents_data, latent_name)
-                print("Save inversion latent.")
-            return None
-                    
-            
-            
-            
-            
-            # Reconstruction
-            for progress_id, t in enumerate(tqdm(timesteps)):
-                
-                latent_model_input = [latent.to(self.device), latent.to(self.device)]
-                timestep = torch.stack([t, t]).to(self.device) 
-                
-                context_list = [context[0], context_null[0]]
-                clip_fea = torch.cat([clip_context, clip_context], dim=0)
-                y_list = [y, y]
-                
-                noise_preds_list = self.model(
-                    x=latent_model_input,
-                    t=timestep,
-                    context=context_list,
-                    seq_len=max_seq_len, # seq_len remains the same for padding
-                    clip_fea=clip_fea,
-                    y=y_list,
-                ) 
-                
+                latents_mid = sample_scheduler_inversion.step_mid(
+                    noise_pred.unsqueeze(0),
+                    torch.stack([t]).to(self.device),
+                    latent.unsqueeze(0),
+                )
+                t_mid = (torch.stack([t]) + sample_scheduler_inversion.timesteps[progress_id + 1]) / 2
+                noise_preds_list_mid = self.model(
+                    x=[latents_mid[0].to(self.device)],
+                    t=torch.stack([t_mid[0]]).to(self.device),
+                    context=[context_blank[0]],
+                    seq_len=max_seq_len,
+                    clip_fea=torch.cat([clip_context], dim=0),
+                    y=[y],
+                )
                 if offload_model:
-                     torch.cuda.empty_cache()
-                
-                noise_pred_cond = noise_preds_list[0].to(torch.device('cpu') if offload_model else self.device)
-                noise_pred_uncond = noise_preds_list[1].to(torch.device('cpu') if offload_model else self.device)
-                
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    torch.cuda.empty_cache()
 
-                latent = latent.to(
-                    torch.device('cpu') if offload_model else self.device)
-                
-                if sample_solver == "fm_new":
-                    latents_mid = sample_scheduler.step_mid(noise_pred.unsqueeze(0), 
-                                                            torch.stack([t]).to(self.device), latent.unsqueeze(0))
-                    
-                    latent_model_input_mid = [latents_mid[0].to(self.device), latents_mid[0].to(self.device)]
-                    
-                    t_mid = (torch.stack([t]) + sample_scheduler.timesteps[progress_id + 1]) / 2
-                    timestep_mid = torch.stack([t_mid[0], t_mid[0]]).to(self.device) 
-                    
-                    noise_preds_list_mid = self.model(
-                        x=latent_model_input_mid,
-                        t=timestep_mid,
-                        context=context_list,
-                        seq_len=max_seq_len,
-                        clip_fea=clip_fea,
-                        y=y_list,
-                    ) 
-                    
-                    if offload_model:
-                        torch.cuda.empty_cache()
-                    
-                    noise_pred_mid_posi = noise_preds_list_mid[0].to(torch.device('cpu') if offload_model else self.device)
-                    noise_pred_mid_nega = noise_preds_list_mid[1].to(torch.device('cpu') if offload_model else self.device)
-                    noise_pred_mid = noise_pred_mid_nega + guide_scale * (noise_pred_mid_posi - noise_pred_mid_nega)
-                    
-                    latent = sample_scheduler.step_solver(noise_pred_mid.unsqueeze(0), noise_pred.unsqueeze(0), 
-                                                          torch.stack([t]).to(self.device), latent.unsqueeze(0)).squeeze(0)
-                    del latent_model_input_mid
-                    
-                else:       
-                    temp_x0 = sample_scheduler.step(
-                        noise_pred.unsqueeze(0),
-                        t,
-                        latent.unsqueeze(0),
-                        return_dict=False,
-                        generator=seed_g)[0]
-                    latent = temp_x0.squeeze(0)
+                noise_pred_mid = noise_preds_list_mid[0].to(torch.device('cpu') if offload_model else self.device)
+                latent = sample_scheduler_inversion.step_solver(
+                    noise_pred_mid.unsqueeze(0),
+                    noise_pred.unsqueeze(0),
+                    torch.stack([t]).to(self.device),
+                    latent.unsqueeze(0),
+                ).squeeze(0)
 
-                x0 = [latent.to(self.device)]
-                del latent_model_input, timestep
+            # 保证至少包含一个高噪声起点 latent
+            if len(timesteps_inversion) > 0:
+                high_noise_t = float(timesteps_inversion[-1].item())
+                save_intermediate_latents_data[high_noise_t] = latent.clone().cpu()
 
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
-            if self.rank == 0:
-                videos = self.vae.decode(x0)
-        
+        if self.rank == 0 and latent_name is not None:
+            torch.save(save_intermediate_latents_data, latent_name)
+            print(f"Saved inversion latents to {latent_name}")
+
         del latent
-        del sample_scheduler
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        return save_intermediate_latents_data if self.rank == 0 else None
+
+    def run_edit_from_inversion(self,
+                 input_prompt,
+                 input_prompt_origin,
+                 img,
+                 img_origin,
+                 max_area=720 * 1280,
+                 frame_num=81,
+                 shift=5.0,
+                 sample_solver='unipc',
+                 sampling_steps=40,
+                 guide_scale=5.0,
+                 n_prompt="",
+                 seed=-1,
+                 offload_model=True,
+                 pnp_layers=None,
+                 load_intermediate_latent_path=None,
+                 load_intermediate_latent_t=None,
+                 injection_step=None,
+                 latent_output_dir=None,
+                 is_delete=False,
+                 ):
+        """
+        从 inversion 产物起步进入编辑，内部维护 latent_origin 与 latent_edit 分支。
+        """
+        if load_intermediate_latent_path is None or load_intermediate_latent_t is None:
+            raise ValueError("run_edit_from_inversion 需要 load_intermediate_latent_path 和 load_intermediate_latent_t。")
+        return self.generate_with_pnp(
+            input_prompt=input_prompt,
+            input_prompt_origin=input_prompt_origin,
+            img=img,
+            img_origin=img_origin,
+            max_area=max_area,
+            frame_num=frame_num,
+            shift=shift,
+            sample_solver=sample_solver,
+            sampling_steps=sampling_steps,
+            guide_scale=guide_scale,
+            n_prompt=n_prompt,
+            seed=seed,
+            offload_model=offload_model,
+            pnp_layers=pnp_layers,
+            load_intermediate_latent_path=load_intermediate_latent_path,
+            load_intermediate_latent_t=load_intermediate_latent_t,
+            injection_step=injection_step,
+            latent_output_dir=latent_output_dir,
+            is_delete=is_delete,
+        )
+
+    def generate_reconstruction(self,
+                 input_prompt,
+                 img,
+                 video: torch.Tensor,
+                 max_area=720 * 1280,
+                 frame_num=81,
+                 shift=5.0,
+                 sample_solver='fm_new',
+                 sampling_steps=50,
+                 guide_scale=5.0,
+                 n_prompt="",
+                 seed=-1,
+                 offload_model=True,
+                 latent_name=None,
+                 is_delete=False,
+                 ):
+        """
+        兼容旧接口：当前仅保留 inversion 职责，重建编辑请使用 run_edit_from_inversion。
+        """
+        return self.run_inversion(
+            input_prompt=input_prompt,
+            img=img,
+            video=video,
+            max_area=max_area,
+            frame_num=frame_num,
+            shift=shift,
+            sample_solver=sample_solver,
+            sampling_steps=sampling_steps,
+            n_prompt=n_prompt,
+            seed=seed,
+            offload_model=offload_model,
+            latent_name=latent_name,
+            is_delete=is_delete,
+        )

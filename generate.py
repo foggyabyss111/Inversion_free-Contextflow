@@ -540,7 +540,7 @@ def generate(args):
         logging.info("Generating video ...")
         if args.pnp:
             #print("PnP Layers:", args.pnp_layers)
-            video1, video2 = wan_i2v.generate_with_pnp(
+            video1, video2 = wan_i2v.run_edit_from_inversion(
                 args.prompt,
                 args.prompt_origin, 
                 img,
@@ -562,7 +562,7 @@ def generate(args):
                 is_delete=True if args.is_delete else False,
             )
         elif args.reconstruction:
-            video = wan_i2v.generate_reconstruction(
+            video = wan_i2v.run_inversion(
                 args.prompt,
                 img, 
                 video_data,
@@ -622,7 +622,9 @@ def generate(args):
                 value_range=(-1, 1))
         else:
             logging.info(f"Saving generated video to {args.save_file}")
-            if args.pnp:
+            if args.reconstruction:
+                logging.info("Reconstruction mode only saves inversion latents; skip video caching.")
+            elif args.pnp:
                 cache_video(
                     tensor=video1[None],
                     save_file=save_file_origin,

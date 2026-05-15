@@ -193,13 +193,25 @@ class WanSelfAttention(nn.Module):
                     k_ref = k_ref.to(device=k.device, dtype=k.dtype)
                     v_ref = v_ref.to(device=v.device, dtype=v.dtype)
 
-                    # 仅干预 target 分支（batch index 1），source 分支保持纯净。
-                    # 需要形状一致，否则跳过该步注入以保证稳定性。
-                    if k[1].shape == k_ref.shape and v[1].shape == v_ref.shape:
+                    # 强化注入逻辑 (V3): 
+                    # 1. 增加基础注入强度 alpha
+                    # 2. 对于极早期步骤 (current_ratio < 0.1)，尝试接近完全替换以锁死结构
+                    current_ratio = float(progress_id) / denom
+                    inj_ratio = max(float(injection_step or 0.0), 0.0)
+                    if inj_ratio > 0.0 and current_ratio <= inj_ratio and b >= 2:
+                        # 强度公式：从 0.95 衰减到 0.0
+                        alpha = 0.95 * (1.0 - (current_ratio / inj_ratio))
+                        
+                        k_ref, v_ref = pnp_cache[cache_key]
+                        k_ref = k_ref.to(device=k.device, dtype=k.dtype)
+                        v_ref = v_ref.to(device=v.device, dtype=v.dtype)
+
                         k = k.clone()
                         v = v.clone()
-                        k[1] = torch.lerp(k[1], k_ref, alpha)
-                        v[1] = torch.lerp(v[1], v_ref, alpha)
+                        for i in range(1, b):
+                            # 对所有 edit 相关分支进行强力结构对齐
+                            k[i] = torch.lerp(k[i], k_ref, alpha)
+                            v[i] = torch.lerp(v[i], v_ref, alpha)
 
         x = flash_attention(
             q,
